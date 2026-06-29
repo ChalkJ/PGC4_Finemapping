@@ -1,0 +1,63 @@
+
+|--------------------------------------|
+| Welcome to FINEMAP v1.4.1            |
+|                                      |
+| (c) 2015-2022 University of Helsinki |
+|                                      |
+| Help :                               |
+| - ./finemap --help                   |
+| - www.finemap.me                     |
+| - www.christianbenner.com            |
+|                                      |
+| Contact:                             |
+| - finemap@christianbenner.com        |
+| - matti.pirinen@helsinki.fi          |
+|--------------------------------------|
+
+--------
+SETTINGS
+--------
+- dataset            : all
+- corr-config        : 0.95
+- n-causal-snps      : 5
+- n-configs-top      : 50000
+- n-conv-sss         : 100
+- n-iter             : 100000
+- n-threads          : 1
+- prior-k0           : 0
+- prior-std          : 0.05 
+- prob-conv-sss-tol  : 0.001
+- prob-cred-set      : 0.95
+
+------------
+FINE-MAPPING (2/10)
+------------
+- GWAS summary stats               : /home/c1977426/sczvsbp/finemap_bd1/002/002.z
+- SNP correlations                 : /home/c1977426/sczvsbp/finemap_bd1/002/002.ld
+- Causal SNP stats                 : /home/c1977426/sczvsbp/finemap_bd1/002/002.snp
+- Causal configurations            : /home/c1977426/sczvsbp/finemap_bd1/002/002.config
+- Credible sets                    : /home/c1977426/sczvsbp/finemap_bd1/002/002.cred
+- Log file                         : /home/c1977426/sczvsbp/finemap_bd1/002/002.log_sss
+
+- Number of GWAS samples           : 51136
+- Number of SNPs                   : 176
+- Prior-Pr(# of causal SNPs is k)  : 
+  (0 -> 0)
+   1 -> 0.583
+   2 -> 0.292
+   3 -> 0.0966
+   4 -> 0.0239
+   5 -> 0.00469
+- 9793 configurations evaluated (0.376/100%) : converged after 376 iterations
+- Regional SNP heritability        : 0.000654 (SD: 0.000223 ; 95% CI: [0.000275,0.00114])
+- Log10-BF of >= one causal SNP    : 4.86927
+- Post-expected # of causal SNPs   : 1.22
+- Post-Pr(# of causal SNPs is k)   : 
+  (0 -> 0)
+   1 -> 0.788
+   2 -> 0.206
+   3 -> 0.00521
+   4 -> 0
+   5 -> 0
+- Run time                         : 0 hours, 0 minutes, 6 seconds
+

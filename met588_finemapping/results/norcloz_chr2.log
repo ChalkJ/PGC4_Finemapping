@@ -1,0 +1,28 @@
+PLINK v1.9.0-b.7.11 64-bit (19 Aug 2025)
+Options in effect:
+  --a1-allele norcloz_chr2.z 4 1
+  --bfile ../data/CLOZUK2_chr2.qc_clozlevels
+  --extract norcloz_chr2.z
+  --out norcloz_chr2
+  --r square spaces
+
+Hostname: cca0019.falcon.supercomputingwales.ac.uk
+Working directory: /shared/scratch/SCWF00151/shared/finemapping/results
+Start time: Tue May  5 22:35:18 2026
+
+Random number seed: 1778016918
+773676 MB RAM detected; reserving 386838 MB for main workspace.
+1102378 variants loaded from .bim file.
+2989 people (0 males, 0 females, 2989 ambiguous) loaded from .fam.
+Ambiguous sex IDs written to norcloz_chr2.nosex .
+--extract: 3040 variants remaining.
+Using up to 8 threads (change this with --threads).
+Before main variant filters, 2989 founders and 0 nonfounders present.
+Calculating allele frequencies... done.
+Total genotyping rate is exactly 1.
+--a1-allele: 3040 assignments made.
+3040 variants and 2989 people pass filters and QC.
+Note: No phenotypes present.
+--r square to norcloz_chr2.ld ... done.
+
+End time: Tue May  5 22:35:19 2026

@@ -1,0 +1,11 @@
+# Post-Pr(# of causal SNPs is 1) = 0.8183
+#log10bf 6.86684 NA
+#min(|ld|) 0.94326 NA
+#mean(|ld|) 0.977325 NA
+#median(|ld|) 0.999889 NA
+index cred1 prob1
+1 rs13117857 0.258298
+2 rs35870167 0.226757
+3 rs35953833 0.226757
+4 rs7669853 0.199171
+5 rs34568676 0.0831607

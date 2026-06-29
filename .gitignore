@@ -1,0 +1,45 @@
+# Large genomic data files - PLINK binary format
+*.bed
+*.bim
+*.fam
+
+# LD matrices (uncompressed, hundreds of MB each)
+*.ld
+
+# LD matrices folder (compressed, still large)
+ld/
+
+# Large summary statistics files
+sumstats/
+
+# Large computed HTML reports (regenerate from Rmd)
+**/master_results.html
+results/results.zip
+
+# met588 workshop raw data (large genomic files)
+met588_finemapping/data/
+
+# met588 test phase intermediate outputs
+met588_finemapping/test_phase1_output/
+met588_finemapping/test_phase2_work/
+met588_finemapping/test_phase2_work_pre_fix/
+met588_finemapping/test_phase3_output/
+met588_finemapping/test_phase4_output/
+
+# Compiled software binaries (platform-specific, re-download as needed)
+met588_finemapping/software/
+
+# FINEMAP config output files (large, regeneratable from LD matrices + sumstats)
+r_files/*/finemap/**/*.config
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Claude Code working directory
+.claude/

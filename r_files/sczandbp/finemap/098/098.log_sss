@@ -1,0 +1,63 @@
+
+|--------------------------------------|
+| Welcome to FINEMAP v1.4.1            |
+|                                      |
+| (c) 2015-2022 University of Helsinki |
+|                                      |
+| Help :                               |
+| - ./finemap --help                   |
+| - www.finemap.me                     |
+| - www.christianbenner.com            |
+|                                      |
+| Contact:                             |
+| - finemap@christianbenner.com        |
+| - matti.pirinen@helsinki.fi          |
+|--------------------------------------|
+
+--------
+SETTINGS
+--------
+- dataset            : all
+- corr-config        : 0.95
+- n-causal-snps      : 5
+- n-configs-top      : 50000
+- n-conv-sss         : 100
+- n-iter             : 100000
+- n-threads          : 1
+- prior-k0           : 0
+- prior-std          : 0.05 
+- prob-conv-sss-tol  : 0.001
+- prob-cred-set      : 0.95
+
+------------
+FINE-MAPPING (96/148)
+------------
+- GWAS summary stats               : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.z
+- SNP correlations                 : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.ld
+- Causal SNP stats                 : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.snp
+- Causal configurations            : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.config
+- Credible sets                    : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.cred
+- Log file                         : /home/c1977426/PGC4/r_files/sczandbp/finemap/098/098.log_sss
+
+- Number of GWAS samples           : 151002
+- Number of SNPs                   : 904
+- Prior-Pr(# of causal SNPs is k)  : 
+  (0 -> 0)
+   1 -> 0.583
+   2 -> 0.291
+   3 -> 0.097
+   4 -> 0.0242
+   5 -> 0.00482
+- 75428 configurations evaluated (0.827/100%) : converged after 827 iterations
+- Regional SNP heritability        : 0.000258 (SD: 8.19e-05 ; 95% CI: [0.00012,0.000437])
+- Log10-BF of >= one causal SNP    : 4.06945
+- Post-expected # of causal SNPs   : 1.51
+- Post-Pr(# of causal SNPs is k)   : 
+  (0 -> 0)
+   1 -> 0.524
+   2 -> 0.444
+   3 -> 0.0323
+   4 -> 0
+   5 -> 0
+- Run time                         : 0 hours, 0 minutes, 30 seconds
+

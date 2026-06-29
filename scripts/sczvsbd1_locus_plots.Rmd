@@ -1,0 +1,685 @@
+---
+title: "SCZ vs BD1 — Fine-mapping (L=5 SuSiE + k=5 FINEMAP)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: false
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+```{r libraries}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(biomaRt)
+library(kableExtra)
+```
+
+```{r paths}
+DATADIR      <- "C:/Users/c1977426/OneDrive - Cardiff University/Documents/sczvsbp"
+LDDIR        <- file.path(DATADIR, "ld_bd1")
+SUSIEDIR     <- file.path(DATADIR, "susie_bd1")
+FMDIR        <- file.path(DATADIR, "finemap_bd1")
+SUMSTATS     <- file.path(DATADIR, "daner_scz_vs_bip1_1025_noduppos_hetpva.gz")
+LOCI_INPUT   <- file.path(DATADIR, "loci_input_bp1.txt")
+VEP_CACHE_F  <- file.path(DATADIR, "vep_cache_bd1.rds")
+GENE_CACHE_F <- file.path(DATADIR, "gene_cache_bd1.rds")
+L_USE        <- 5
+
+# LD heatmap palette (matches reheatmap.R: blue–white–red diverging)
+ld_pal <- colorRampPalette(c("#313695", "#74add1", "#e0f3f8", "#ffffbf",
+                              "#fee090", "#f46d43", "#a50026"))(256)
+```
+
+```{r load-data}
+sumstats <- fread(SUMSTATS)
+sumstats <- sumstats[HetPVa > 0.05]
+sumstats[, zscore := log(OR) / SE]
+
+loci_input <- fread(LOCI_INPUT, header = FALSE,
+                    col.names = c("locus_id", "chr", "start", "end"))
+```
+
+```{r mart-setup}
+grch38 <- NULL
+for (mir in c("useast", "uswest", "asia", "www")) {
+  grch38 <- tryCatch(
+    useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl", mirror = mir),
+    error = function(e) NULL
+  )
+  if (!is.null(grch38)) { message("biomaRt: ", mir); break }
+}
+if (is.null(grch38)) warning("All Ensembl mirrors failed — gene tracks disabled")
+```
+
+```{r helpers}
+assign_y_levels <- function(genes, max_levels = 5,
+                            min_center_distance = NULL,
+                            min_end_distance    = 20000) {
+  genes <- genes[order(genes$start), ]
+  n     <- nrow(genes)
+  span  <- max(genes$end) - min(genes$start)
+  if (is.null(min_center_distance)) min_center_distance <- max(20000, span / 15)
+  lvls  <- vector("list", max_levels)
+  for (i in seq_len(n)) {
+    placed <- FALSE
+    for (j in seq_len(max_levels)) {
+      if (length(lvls[[j]]) == 0) {
+        lvls[[j]] <- c(lvls[[j]], i); placed <- TRUE; break
+      } else {
+        last <- lvls[[j]][length(lvls[[j]])]
+        cd   <- ((genes$start[i] + genes$end[i]) -
+                 (genes$start[last] + genes$end[last])) / 2
+        ed   <- genes$start[i] - genes$end[last]
+        if (cd >= min_center_distance && ed >= min_end_distance) {
+          lvls[[j]] <- c(lvls[[j]], i); placed <- TRUE; break
+        }
+      }
+    }
+    if (!placed) { max_levels <- max_levels + 1; lvls[[max_levels]] <- i }
+  }
+  y <- rep(0, n)
+  for (i in seq_along(lvls)) y[lvls[[i]]] <- i
+  genes$y_level <- y
+  genes
+}
+```
+
+```{r load-fits}
+all_fits      <- list()
+fit_meta      <- list()
+cs_snp_tables <- list()
+ld_matrices   <- list()   # pre-load LD for heatmaps
+
+for (i in seq_len(nrow(loci_input))) {
+  locus <- sprintf("%03d", loci_input$locus_id[i])
+
+  # Load SuSiE fit — try L=5, fall back to L=10 if rerun was needed
+  fit <- NULL
+  for (L_try in c(L_USE, 10)) {
+    rds_path <- file.path(SUSIEDIR, sprintf("%s.susie_l%d.rds", locus, L_try))
+    if (file.exists(rds_path)) {
+      fit <- readRDS(rds_path)
+      if (!is.null(fit$snp_ids)) break
+    }
+  }
+
+  all_fits[[locus]] <- fit
+  if (is.null(fit) || is.null(fit$snp_ids)) next
+
+  has_cs <- !is.null(fit$sets$cs) && length(fit$sets$cs) > 0
+  n_cs   <- if (has_cs) length(fit$sets$cs) else 0L
+
+  fit_meta[[locus]] <- list(
+    has_cs    = has_cs,
+    n_cs      = n_cs,
+    cs_sizes  = if (has_cs) vapply(fit$sets$cs, length, integer(1)) else integer(0),
+    cs_cov    = if (has_cs && !is.null(fit$sets$coverage))
+                  min(fit$sets$coverage, na.rm = TRUE) else NA_real_,
+    sigma2    = if (!is.null(fit$sigma2)) fit$sigma2 else NA_real_,
+    converged = fit$converged,
+    lead_snp  = fit$snp_ids[which.max(fit$pip)],
+    lead_pip  = max(fit$pip)
+  )
+
+  if (!has_cs) next
+  cs_snp_tables[[locus]] <- list()
+  for (cs_i in seq_len(n_cs)) {
+    idx     <- fit$sets$cs[[cs_i]]
+    cs_snps <- fit$snp_ids[idx]
+    cs_pips <- fit$pip[idx]
+    ss_cs   <- sumstats[match(cs_snps, SNP)]
+    dt <- data.table(
+      SNP  = cs_snps,
+      PIP  = round(cs_pips, 4),
+      z    = round(ss_cs$zscore, 3),
+      OR   = round(ss_cs$OR, 3),
+      SE   = round(ss_cs$SE, 4),
+      P    = formatC(ss_cs$P, format = "e", digits = 2),
+      INFO = if ("INFO" %in% names(ss_cs)) round(ss_cs$INFO, 3) else NA_real_
+    )
+    cs_snp_tables[[locus]][[cs_i]] <- dt[order(-PIP)]
+  }
+}
+```
+
+```{r load-ld}
+for (i in seq_len(nrow(loci_input))) {
+  locus   <- sprintf("%03d", loci_input$locus_id[i])
+  ld_file <- file.path(LDDIR, paste0(locus, ".ld.gz"))
+  snp_log <- file.path(LDDIR, paste0(locus, ".snp.log"))
+  if (!file.exists(ld_file)) next
+  ld_snps <- if (file.exists(snp_log)) readLines(snp_log) else NULL
+  LD <- as.matrix(fread(ld_file, header = FALSE))
+  if (!is.null(ld_snps)) dimnames(LD) <- list(ld_snps, ld_snps)
+  diag(LD) <- 1.0
+  ld_matrices[[locus]] <- LD
+}
+```
+
+```{r gene-fetch}
+gene_cache  <- if (file.exists(GENE_CACHE_F)) readRDS(GENE_CACHE_F) else list()
+unique_chrs <- unique(loci_input$chr)
+
+if (!is.null(grch38)) {
+  for (chr in unique_chrs) {
+    cache_key <- paste0("chr", chr)
+    if (cache_key %in% names(gene_cache)) next
+    genes <- tryCatch(
+      getBM(
+        attributes = c("ensembl_gene_id", "external_gene_name",
+                       "start_position", "end_position"),
+        filters    = c("chromosome_name", "biotype"),
+        values     = list(as.character(chr), "protein_coding"),
+        mart       = grch38
+      ),
+      error = function(e) { message("Gene fetch chr", chr, ": ", e$message); NULL }
+    )
+    gene_cache[[cache_key]] <- genes
+  }
+  saveRDS(gene_cache, GENE_CACHE_F)
+}
+```
+
+```{r vep-query}
+vep_cache <- if (file.exists(VEP_CACHE_F)) readRDS(VEP_CACHE_F) else list()
+
+for (locus in names(cs_snp_tables)) {
+  chr_val   <- loci_input[locus_id == as.integer(locus), chr]
+  chr_genes <- gene_cache[[paste0("chr", chr_val)]]
+
+  for (cs_i in seq_along(cs_snp_tables[[locus]])) {
+    dt <- cs_snp_tables[[locus]][[cs_i]]
+
+    dt[, Consequence := sapply(SNP, function(s)
+      if (s %in% names(vep_cache)) vep_cache[[s]]$consequence else NA_character_)]
+
+    dt[, Gene := {
+      bp_vec <- sumstats$BP[match(SNP, sumstats$SNP)]
+      sapply(bp_vec, function(bp) {
+        if (is.null(chr_genes) || is.na(bp) || nrow(chr_genes) == 0) return(NA_character_)
+        hits <- chr_genes[chr_genes$start_position <= bp & chr_genes$end_position >= bp, ]
+        if (nrow(hits) == 0) return(NA_character_)
+        syms <- hits$external_gene_name[!is.na(hits$external_gene_name) & hits$external_gene_name != ""]
+        if (length(syms) == 0) return(NA_character_)
+        paste(unique(syms), collapse = "; ")
+      })
+    }]
+
+    cs_snp_tables[[locus]][[cs_i]] <- dt
+  }
+}
+```
+
+```{r plot-function}
+make_locus_plot <- function(locus_num, cs_highlight = 1) {
+  locus    <- sprintf("%03d", locus_num)
+  li       <- loci_input[locus_id == locus_num]
+  bp_start <- li$start
+  bp_stop  <- li$end
+  chr_val  <- li$chr
+
+  fit    <- all_fits[[locus]]
+  in_cs  <- character(0)
+
+  if (!is.null(fit) && !is.null(fit$snp_ids)) {
+    fit_pos <- sumstats[SNP %in% fit$snp_ids & CHR == chr_val, BP]
+    if (length(fit_pos) > 0) {
+      bp_start <- min(bp_start, min(fit_pos))
+      bp_stop  <- max(bp_stop,  max(fit_pos))
+    }
+    if (cs_highlight > 0 && !is.null(fit$sets$cs) && cs_highlight <= length(fit$sets$cs))
+      in_cs <- fit$snp_ids[fit$sets$cs[[cs_highlight]]]
+  }
+
+  ss <- sumstats[CHR == chr_val & BP >= bp_start & BP <= bp_stop]
+  if (nrow(ss) == 0) return(NULL)
+
+  pip_map <- setNames(rep(0, nrow(ss)), ss$SNP)
+  if (!is.null(fit) && !is.null(fit$snp_ids)) {
+    shared <- intersect(ss$SNP, fit$snp_ids)
+    pip_map[shared] <- fit$pip[match(shared, fit$snp_ids)]
+  }
+
+  ss[, PIP    := pip_map[SNP]]
+  ss[, in_cs  := SNP %in% in_cs]
+  ss[, log10p := -log10(P)]
+
+  cs_label <- if (cs_highlight > 0) sprintf(" CS%d", cs_highlight) else ""
+  snp_plot <- ggplot(ss, aes(x = BP, y = log10p)) +
+    geom_point(aes(color = in_cs, size = PIP, alpha = PIP)) +
+    scale_size_continuous(range = c(0.5, 5), limits = c(0, 1)) +
+    scale_alpha_continuous(range = c(0.3, 1), limits = c(0, 1)) +
+    scale_color_manual(values = c("FALSE" = "#5D3A9B", "TRUE" = "#E66100"),
+                       labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+    scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+    labs(y     = expression(-log[10](italic(p))),
+         color = "In 95% CS",
+         title = sprintf("Locus %d — Chr%d:%s–%s | L=5%s",
+                         locus_num, chr_val,
+                         formatC(bp_start, format = "d", big.mark = ","),
+                         formatC(bp_stop,  format = "d", big.mark = ","),
+                         cs_label)) +
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_blank(),
+          axis.ticks.x = element_blank())
+
+  chr_genes <- gene_cache[[paste0("chr", chr_val)]]
+  gene_plot <- NULL
+  max_y     <- 1
+
+  if (!is.null(chr_genes) && nrow(chr_genes) > 0) {
+    genes <- chr_genes %>%
+      filter(
+        (start_position <= bp_start & end_position >= bp_start) |
+        (start_position <= bp_stop  & end_position >= bp_stop)  |
+        (start_position <= bp_start & end_position >= bp_stop)  |
+        (start_position >= bp_start & end_position <= bp_stop)
+      )
+
+    if (nrow(genes) > 0) {
+      genes <- genes %>%
+        mutate(
+          gene_label   = ifelse(!is.na(external_gene_name) & external_gene_name != "",
+                                external_gene_name, ensembl_gene_id),
+          gene_support = 0
+        )
+
+      if (any(ss$in_cs)) {
+        cs_pos <- ss[(in_cs), .(BP, PIP)]
+        for (k in seq_len(nrow(cs_pos))) {
+          hit <- which(genes$start_position <= cs_pos$BP[k] &
+                       genes$end_position   >= cs_pos$BP[k])
+          genes$gene_support[hit] <- genes$gene_support[hit] + cs_pos$PIP[k]
+        }
+      }
+
+      genes <- genes %>%
+        mutate(start_position = pmax(start_position, bp_start),
+               end_position   = pmin(end_position,   bp_stop))
+
+      gd_y  <- genes %>% transmute(gene_id = ensembl_gene_id,
+                                   start = start_position, end = end_position)
+      gd_y  <- assign_y_levels(gd_y)
+      genes <- left_join(genes, gd_y,
+                         by = c("ensembl_gene_id" = "gene_id",
+                                "start_position"  = "start",
+                                "end_position"    = "end"))
+      max_y <- max(genes$y_level, na.rm = TRUE)
+
+      gene_plot <- ggplot(genes, aes(x = start_position, y = y_level)) +
+        geom_segment(aes(xend = end_position, yend = y_level, color = gene_support),
+                     linewidth = 4) +
+        scale_color_gradient(low = "#8B73B5", high = "#E66100",
+                             limits = c(0, 1), na.value = "#8B73B5") +
+        geom_text_repel(aes(x = (start_position + end_position) / 2, label = gene_label),
+                        size = 2.8, nudge_y = 0.45, direction = "x",
+                        segment.color = NA, max.overlaps = Inf) +
+        scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+        scale_y_continuous(limits = c(0.3, max_y + 1)) +
+        labs(x = sprintf("Chr%d position (GRCh38)", chr_val), color = "Cumul. PIP") +
+        theme_bw() +
+        theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+              axis.title.y = element_blank())
+    }
+  }
+
+  if (!is.null(gene_plot))
+    snp_plot + gene_plot + plot_layout(ncol = 1, heights = c(3, max(1.2, max_y * 0.6)))
+  else
+    snp_plot
+}
+
+# LD heatmap — square aspect ratio via layout(); colour bar in right panel.
+# on.exit restores par/layout so subsequent ggplot2 panels are unaffected.
+make_ld_heatmap <- function(locus_num) {
+  locus <- sprintf("%03d", locus_num)
+  LD    <- ld_matrices[[locus]]
+  if (is.null(LD)) { message("No LD matrix for locus ", locus); return(invisible(NULL)) }
+
+  n       <- nrow(LD)
+  old_par <- par(no.readonly = TRUE)
+  on.exit({ layout(1); par(old_par) }, add = TRUE)
+
+  # Two-panel layout: wide heatmap | narrow colour bar
+  layout(matrix(c(1L, 2L), 1L, 2L), widths = c(8, 1))
+
+  # Panel 1 — square heatmap
+  par(mar = c(2, 2, 3, 0.5), pty = "s")
+  image(seq_len(n), seq_len(n), LD,
+        col = ld_pal, zlim = c(-1, 1), axes = FALSE, useRaster = TRUE,
+        main = sprintf("LD r matrix — locus %d  (%d × %d SNPs)", locus_num, n, n),
+        xlab = "", ylab = "")
+
+  # Panel 2 — vertical colour bar
+  par(mar = c(2, 0.5, 3, 2.5), pty = "m")
+  image(1L, seq(-1, 1, length.out = 256),
+        matrix(seq(-1, 1, length.out = 256), nrow = 1L),
+        col = ld_pal, zlim = c(-1, 1), xaxt = "n", yaxt = "n",
+        xlab = "", ylab = "")
+  axis(4, at = c(-1, 0, 1), labels = c("-1", "0", "1"), las = 1, cex.axis = 0.85)
+  mtext("r", side = 4, line = 2, cex = 0.85)
+}
+
+# FINEMAP locus zoom — identical style to make_locus_plot but coloured by FINEMAP PIP.
+# cs_snps_highlight: character vector of SNP IDs to highlight (one CS);
+#                    NULL = highlight all CS SNPs from every cred file.
+# cs_label: appended to plot title, e.g. " CS1"
+make_finemap_plot <- function(locus_num, cs_snps_highlight = NULL, cs_label = "") {
+  locus        <- sprintf("%03d", locus_num)
+  li           <- loci_input[locus_id == locus_num]
+  chr_val      <- li$chr
+  bp_start     <- li$start
+  bp_stop      <- li$end
+
+  # Load FINEMAP per-SNP PIPs
+  fm_locus_dir <- file.path(FMDIR, locus)
+  snp_file     <- file.path(fm_locus_dir, paste0(locus, ".snp"))
+  if (!file.exists(snp_file)) return(NULL)
+  fm_snps <- fread(snp_file)   # cols: rsid, prob, log10bf, …
+
+  # If no specific CS supplied, collect all CS SNPs from every cred file
+  if (is.null(cs_snps_highlight)) {
+    cred_files <- list.files(fm_locus_dir,
+                             pattern = paste0("^", locus, "\\.cred[0-9]+$"),
+                             full.names = TRUE)
+    all_cs_snps <- character(0)
+    for (cf in sort(cred_files)) {
+      lines     <- readLines(cf)
+      skip_rows <- grep("^index", lines) - 1
+      if (length(skip_rows) == 0) next
+      dat <- tryCatch(fread(cf, skip = skip_rows), error = function(e) NULL)
+      if (is.null(dat)) next
+      cs_cols <- grep("^cred[0-9]+$", names(dat), value = TRUE)
+      for (col in cs_cols) {
+        snps <- dat[[col]][!is.na(dat[[col]])]
+        all_cs_snps <- union(all_cs_snps, snps)
+      }
+    }
+  } else {
+    all_cs_snps <- cs_snps_highlight
+  }
+
+  # Extend window to cover all FINEMAP SNPs
+  fm_pos <- sumstats[SNP %in% fm_snps$rsid & CHR == chr_val, BP]
+  if (length(fm_pos) > 0) {
+    bp_start <- min(bp_start, min(fm_pos))
+    bp_stop  <- max(bp_stop,  max(fm_pos))
+  }
+
+  ss <- sumstats[CHR == chr_val & BP >= bp_start & BP <= bp_stop]
+  if (nrow(ss) == 0) return(NULL)
+
+  pip_map <- setNames(rep(0, nrow(ss)), ss$SNP)
+  shared  <- intersect(ss$SNP, fm_snps$rsid)
+  pip_map[shared] <- fm_snps$prob[match(shared, fm_snps$rsid)]
+
+  ss[, PIP    := pip_map[SNP]]
+  ss[, in_cs  := SNP %in% all_cs_snps]
+  ss[, log10p := -log10(P)]
+
+  snp_plot <- ggplot(ss, aes(x = BP, y = log10p)) +
+    geom_point(aes(color = in_cs, size = PIP, alpha = PIP)) +
+    scale_size_continuous(range = c(0.5, 5), limits = c(0, 1)) +
+    scale_alpha_continuous(range = c(0.3, 1), limits = c(0, 1)) +
+    scale_color_manual(values = c("FALSE" = "#5D3A9B", "TRUE" = "#E66100"),
+                       labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+    scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+    labs(y     = expression(-log[10](italic(p))),
+         color = "In FINEMAP CS",
+         title = sprintf("Locus %d — Chr%d:%s–%s | FINEMAP k=5%s",
+                         locus_num, chr_val,
+                         formatC(bp_start, format = "d", big.mark = ","),
+                         formatC(bp_stop,  format = "d", big.mark = ","),
+                         cs_label)) +
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_blank(),
+          axis.ticks.x = element_blank())
+
+  chr_genes <- gene_cache[[paste0("chr", chr_val)]]
+  gene_plot <- NULL; max_y <- 1
+
+  if (!is.null(chr_genes) && nrow(chr_genes) > 0) {
+    genes <- chr_genes %>%
+      filter(
+        (start_position <= bp_start & end_position >= bp_start) |
+        (start_position <= bp_stop  & end_position >= bp_stop)  |
+        (start_position <= bp_start & end_position >= bp_stop)  |
+        (start_position >= bp_start & end_position <= bp_stop)
+      )
+    if (nrow(genes) > 0) {
+      genes <- genes %>%
+        mutate(gene_label   = ifelse(!is.na(external_gene_name) & external_gene_name != "",
+                                     external_gene_name, ensembl_gene_id),
+               gene_support = 0)
+      if (any(ss$in_cs)) {
+        cs_pos <- ss[(in_cs), .(BP, PIP)]
+        for (k in seq_len(nrow(cs_pos))) {
+          hit <- which(genes$start_position <= cs_pos$BP[k] & genes$end_position >= cs_pos$BP[k])
+          genes$gene_support[hit] <- genes$gene_support[hit] + cs_pos$PIP[k]
+        }
+      }
+      genes <- genes %>%
+        mutate(start_position = pmax(start_position, bp_start),
+               end_position   = pmin(end_position,   bp_stop))
+      gd_y  <- genes %>% transmute(gene_id = ensembl_gene_id,
+                                   start = start_position, end = end_position)
+      gd_y  <- assign_y_levels(gd_y)
+      genes <- left_join(genes, gd_y,
+                         by = c("ensembl_gene_id" = "gene_id",
+                                "start_position"  = "start",
+                                "end_position"    = "end"))
+      max_y <- max(genes$y_level, na.rm = TRUE)
+      gene_plot <- ggplot(genes, aes(x = start_position, y = y_level)) +
+        geom_segment(aes(xend = end_position, yend = y_level, color = gene_support),
+                     linewidth = 4) +
+        scale_color_gradient(low = "#8B73B5", high = "#E66100",
+                             limits = c(0, 1), na.value = "#8B73B5") +
+        geom_text_repel(aes(x = (start_position + end_position) / 2, label = gene_label),
+                        size = 2.8, nudge_y = 0.45, direction = "x",
+                        segment.color = NA, max.overlaps = Inf) +
+        scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+        scale_y_continuous(limits = c(0.3, max_y + 1)) +
+        labs(x = sprintf("Chr%d position (GRCh38)", chr_val), color = "Cumul. PIP") +
+        theme_bw() +
+        theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+              axis.title.y = element_blank())
+    }
+  }
+
+  if (!is.null(gene_plot))
+    snp_plot + gene_plot + plot_layout(ncol = 1, heights = c(3, max(1.2, max_y * 0.6)))
+  else
+    snp_plot
+}
+
+# FINEMAP summary table for a locus
+finemap_table <- function(locus_num, top_n = 20) {
+  locus        <- sprintf("%03d", locus_num)
+  fm_locus_dir <- file.path(FMDIR, locus)
+  snp_file     <- file.path(fm_locus_dir, paste0(locus, ".snp"))
+  if (!file.exists(snp_file)) return(invisible(NULL))
+
+  fm_snps <- fread(snp_file)
+  setorder(fm_snps, -prob)
+  dt <- head(fm_snps[, .(rsid, prob, log10bf)], top_n)
+  names(dt) <- c("SNP", "FINEMAP PIP", "log10BF")
+  dt[, `FINEMAP PIP` := round(`FINEMAP PIP`, 4)]
+  dt[, log10BF       := round(log10BF, 3)]
+  dt
+}
+```
+
+## Results {.tabset}
+
+```{r tabs, results='asis'}
+for (i in seq_len(nrow(loci_input))) {
+  li        <- loci_input[i]
+  locus     <- sprintf("%03d", li$locus_id)
+  locus_num <- li$locus_id
+  fit       <- all_fits[[locus]]
+  meta      <- fit_meta[[locus]]
+
+  cat(sprintf("\n\n### Locus %d (Chr%d) {.tabset}\n\n", locus_num, li$chr))
+
+  # ── SuSiE tab ──────────────────────────────────────────────────────────────
+  has_cs <- !is.null(meta) && isTRUE(meta$has_cs)
+  n_cs   <- if (!is.null(meta)) meta$n_cs else 0L
+  tabset_attr <- if (has_cs && n_cs > 0) " {.tabset}" else ""
+  cat(sprintf("\n\n#### SuSiE L=5%s\n\n", tabset_attr))
+
+  if (is.null(meta)) {
+    cat("*No SuSiE result available.*\n\n")
+  } else {
+    sigma2 <- if (!is.na(meta$sigma2)) round(meta$sigma2, 4) else "--"
+    cat(sprintf(
+      "**CS:** %s &nbsp;|&nbsp; **N credible sets:** %d &nbsp;|&nbsp; **σ²:** %s &nbsp;|&nbsp; **Converged:** %s\n\n",
+      ifelse(has_cs, "Yes", "No"), n_cs, sigma2, meta$converged
+    ))
+
+    if (!has_cs) {
+      cat(sprintf("*No credible set. Top PIP SNP: **%s** (PIP = %.4f)*\n\n",
+                  meta$lead_snp, meta$lead_pip))
+      p <- tryCatch(make_locus_plot(locus_num, cs_highlight = 0), error = function(e) NULL)
+      if (!is.null(p)) print(p)
+    } else {
+      for (cs_i in seq_len(n_cs)) {
+        cs_size <- meta$cs_sizes[cs_i]
+        cs_cov  <- if (!is.na(meta$cs_cov)) round(meta$cs_cov, 4) else "--"
+        cat(sprintf("\n\n##### CS%d\n\n", cs_i))
+        cat(sprintf(
+          "**CS size:** %d &nbsp;|&nbsp; **Coverage:** %s &nbsp;|&nbsp; **Region:** Chr%d: %s–%s\n\n",
+          cs_size, cs_cov, li$chr,
+          formatC(li$start, format = "d", big.mark = ","),
+          formatC(li$end,   format = "d", big.mark = ",")
+        ))
+
+        dt <- cs_snp_tables[[locus]][[cs_i]]
+        if (!is.null(dt) && nrow(dt) > 0) {
+          cat(sprintf(
+            '<details><summary><strong>Credible set SNPs &mdash; %d SNP%s (click to expand)</strong></summary>\n\n',
+            nrow(dt), if (nrow(dt) == 1) "" else "s"
+          ))
+          tbl <- knitr::kable(dt, format = "html", row.names = FALSE,
+                              col.names = c("SNP", "PIP", "z", "OR", "SE", "P", "INFO",
+                                            "VEP consequence", "Gene(s)")) %>%
+            kableExtra::kable_styling(
+              bootstrap_options = c("striped", "condensed", "hover"),
+              full_width = FALSE, font_size = 13)
+          cat(as.character(tbl), "\n\n</details>\n\n")
+        }
+
+        p <- tryCatch(make_locus_plot(locus_num, cs_i), error = function(e) NULL)
+        if (!is.null(p)) print(p)
+      }
+    }
+  }
+
+  # ── FINEMAP tab ─────────────────────────────────────────────────────────────
+  # Find best cred file (highest Pr(k)) and parse CS membership
+  fm_cred_files <- sort(list.files(file.path(FMDIR, locus),
+                                   pattern = paste0("^", locus, "\\.cred[0-9]+$"),
+                                   full.names = TRUE))
+  best_cred_file <- NULL; best_pr <- -1
+  for (cf in fm_cred_files) {
+    hdr     <- readLines(cf, n = 2)
+    pr_match <- regmatches(hdr[1], regexpr("[0-9\\.eE\\+\\-]+$", hdr[1]))
+    pr_val  <- if (length(pr_match) > 0) suppressWarnings(as.numeric(pr_match)) else NA_real_
+    if (!is.na(pr_val) && pr_val > best_pr) { best_pr <- pr_val; best_cred_file <- cf }
+  }
+  fm_cs_list <- list()
+  if (!is.null(best_cred_file)) {
+    clines    <- readLines(best_cred_file)
+    skip_rows <- grep("^index", clines) - 1
+    if (length(skip_rows) > 0) {
+      cdat <- tryCatch(fread(best_cred_file, skip = skip_rows[1]), error = function(e) NULL)
+      if (!is.null(cdat)) {
+        cs_cols <- grep("^cred[0-9]+$", names(cdat), value = TRUE)
+        for (col in cs_cols) {
+          snps <- cdat[[col]][!is.na(cdat[[col]])]
+          if (length(snps) > 0) fm_cs_list[[col]] <- snps
+        }
+      }
+    }
+  }
+  n_fm_cs   <- length(fm_cs_list)
+  fm_tabset <- if (n_fm_cs > 1) " {.tabset}" else ""
+  cat(sprintf("\n\n#### FINEMAP k=5%s\n\n", fm_tabset))
+
+  fm_log <- file.path(FMDIR, locus, paste0(locus, ".log_sss"))
+  if (!file.exists(fm_log)) {
+    cat("*FINEMAP results not found for this locus.*\n\n")
+  } else {
+    ll         <- readLines(fm_log)
+    post_start <- grep("Post-Pr\\(# of causal", ll)
+    post_lines <- if (length(post_start) > 0) ll[post_start[1]:length(ll)] else character(0)
+    exp_line   <- grep("Post-expected", ll, value = TRUE)
+    exp_k      <- if (length(exp_line) > 0)
+      regmatches(exp_line[1], regexpr("[0-9\\.]+$", exp_line[1])) else "—"
+
+    cat(sprintf("**Post-expected # causal SNPs:** %s\n\n", exp_k))
+    cat("**Posterior Pr(k):**\n\n```\n")
+    in_sec <- FALSE
+    for (ln in post_lines) {
+      if (grepl("Post-Pr\\(# of causal", ln)) in_sec <- TRUE
+      if (in_sec) { cat(ln, "\n"); if (grepl("^\\s+5 ->", ln)) break }
+    }
+    cat("```\n\n")
+
+    # Overall SNP table (collapsible) — always at parent level
+    dt_fm <- finemap_table(locus_num)
+    if (!is.null(dt_fm) && nrow(dt_fm) > 0) {
+      cat(sprintf(
+        '<details><summary><strong>Top %d SNPs by FINEMAP PIP (click to expand)</strong></summary>\n\n',
+        nrow(dt_fm)
+      ))
+      tbl <- knitr::kable(dt_fm, format = "html", row.names = FALSE) %>%
+        kableExtra::kable_styling(bootstrap_options = c("striped", "condensed", "hover"),
+                                  full_width = FALSE, font_size = 13)
+      cat(as.character(tbl), "\n\n</details>\n\n")
+    }
+
+    # Per-CS locus zoom plots
+    if (n_fm_cs > 1) {
+      for (cs_i in seq_along(fm_cs_list)) {
+        cat(sprintf("\n\n##### CS%d\n\n", cs_i))
+        cat(sprintf("**%d SNPs in this credible set**\n\n", length(fm_cs_list[[cs_i]])))
+        p_fm <- tryCatch(
+          make_finemap_plot(locus_num, cs_snps_highlight = fm_cs_list[[cs_i]],
+                            cs_label = sprintf(" CS%d", cs_i)),
+          error = function(e) NULL
+        )
+        if (!is.null(p_fm)) print(p_fm)
+      }
+    } else {
+      p_fm <- tryCatch(make_finemap_plot(locus_num), error = function(e) NULL)
+      if (!is.null(p_fm)) print(p_fm)
+    }
+  }
+
+  # ── LD Heatmap tab ──────────────────────────────────────────────────────────
+  cat("\n\n#### LD Heatmap\n\n")
+  if (!is.null(ld_matrices[[locus]])) {
+    n_snps <- nrow(ld_matrices[[locus]])
+    cat(sprintf("**%d × %d LD matrix** (signed r, blue = negative, red = positive)\n\n", n_snps, n_snps))
+    # Render inline — base R image() is captured by knitr
+    make_ld_heatmap(locus_num)
+  } else {
+    cat("*LD matrix not available for this locus.*\n\n")
+  }
+}
+```
+
+---
+
+<small>SCZ vs BD1 fine-mapping — Cardiff University</small>

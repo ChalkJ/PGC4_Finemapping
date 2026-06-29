@@ -1,0 +1,766 @@
+---
+title: "SCZ/BIP Fine-mapping — Master Results"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: false
+    self_contained: true
+---
+
+<script>
+function showLocus(analysis, val) {
+  var divs = document.getElementsByClassName('locus-' + analysis);
+  for (var i = 0; i < divs.length; i++) divs[i].style.display = 'none';
+  if (val !== '') {
+    var el = document.getElementById(analysis + '-' + val);
+    if (el) el.style.display = 'block';
+  }
+}
+</script>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries, include=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(biomaRt)
+library(kableExtra)
+library(scales)
+```
+
+```{r config, include=FALSE}
+BASE <- "C:/Users/c1977426/OneDrive - Cardiff University/Documents/PGC4"
+
+analyses <- list(
+  sczvsbp = list(
+    label    = "SCZ vs BIP",
+    dir      = file.path(BASE, "r_files/sczvsbp"),
+    ld_dir   = file.path(BASE, "ld/sczvsbp"),
+    sumstats = file.path(BASE, "sumstats/daner_scz_vs_bip_1025_noduppos_hetpva.gz")
+  ),
+  sczvsbp1 = list(
+    label    = "SCZ vs BIP1",
+    dir      = file.path(BASE, "r_files/sczvsbp1"),
+    ld_dir   = file.path(BASE, "ld/sczvsbp1"),
+    sumstats = file.path(BASE, "sumstats/daner_scz_vs_bip1_1025_noduppos_hetpva.gz")
+  ),
+  sczandbp = list(
+    label    = "SCZ + BIP vs Controls",
+    dir      = file.path(BASE, "r_files/sczandbp"),
+    ld_dir   = file.path(BASE, "ld/sczandbp"),
+    sumstats = file.path(BASE, "sumstats/daner_scz_bip_vs_allcontrols_1025_noduppos_hetpva.gz")
+  )
+)
+
+L_USE        <- 5
+GENE_CACHE_F <- file.path(BASE, "r_files/gene_cache_v2.rds")  # v2 includes lncRNA
+PLOT_DIR     <- file.path(BASE, "results/plots")
+dir.create(PLOT_DIR, showWarnings = FALSE, recursive = TRUE)
+ld_pal       <- colorRampPalette(c("#313695","#74add1","#e0f3f8","#ffffbf",
+                                    "#fee090","#f46d43","#a50026"))(256)
+```
+
+```{r helpers, include=FALSE}
+# ── Stagger overlapping gene labels onto separate y-levels ──────────────────
+assign_y_levels <- function(genes, max_levels = 5,
+                            min_center_distance = NULL, min_end_distance = 20000) {
+  genes <- genes[order(genes$start), ]
+  n     <- nrow(genes)
+  span  <- max(genes$end) - min(genes$start)
+  if (is.null(min_center_distance)) min_center_distance <- max(20000, span / 15)
+  lvls  <- vector("list", max_levels)
+  for (i in seq_len(n)) {
+    placed <- FALSE
+    for (j in seq_len(max_levels)) {
+      if (length(lvls[[j]]) == 0) {
+        lvls[[j]] <- c(lvls[[j]], i); placed <- TRUE; break
+      } else {
+        last <- lvls[[j]][length(lvls[[j]])]
+        cd <- ((genes$start[i] + genes$end[i]) - (genes$start[last] + genes$end[last])) / 2
+        ed <- genes$start[i] - genes$end[last]
+        if (cd >= min_center_distance && ed >= min_end_distance) {
+          lvls[[j]] <- c(lvls[[j]], i); placed <- TRUE; break
+        }
+      }
+    }
+    if (!placed) { max_levels <- max_levels + 1; lvls[[max_levels]] <- i }
+  }
+  y <- rep(0L, n)
+  for (k in seq_along(lvls)) y[lvls[[k]]] <- k
+  genes$y_level <- y
+  genes
+}
+
+# ── Assign gene name by BP position using biomaRt gene cache ────────────────
+# Returns gene name(s) if SNP BP falls within a gene boundary, else NA
+gene_by_position <- function(snp_ids, chr_val, ss, chr_genes) {
+  if (is.null(chr_genes) || nrow(chr_genes) == 0) return(rep(NA_character_, length(snp_ids)))
+  bp_vec <- ss$BP[match(snp_ids, ss$SNP)]
+  sapply(bp_vec, function(bp) {
+    if (is.na(bp)) return(NA_character_)
+    hits <- chr_genes[chr_genes$start_position <= bp & chr_genes$end_position >= bp, ]
+    if (nrow(hits) == 0) return(NA_character_)
+    nms <- hits$external_gene_name[!is.na(hits$external_gene_name) & hits$external_gene_name != ""]
+    if (length(nms) == 0) return(NA_character_)
+    paste(unique(nms), collapse = "; ")
+  })
+}
+
+# ── Save a ggplot/patchwork to file and return an <img> tag ─────────────────
+# Use absolute path in src so pandoc --embed-resources can find and inline it
+embed_gg <- function(p, fname, width = 9.5, height = 5.5) {
+  path <- file.path(PLOT_DIR, fname)
+  ggplot2::ggsave(path, plot = p, width = width, height = height, dpi = 90)
+  sprintf('<img src="%s" style="width:100%%;max-width:960px;display:block;margin:8px auto;"/>\n',
+          gsub("\\\\", "/", normalizePath(path, mustWork = FALSE)))
+}
+
+# ── Save a base-R plot to file and return an <img> tag ──────────────────────
+embed_base <- function(draw_fn, fname, width = 9.5, height = 7) {
+  path <- file.path(PLOT_DIR, fname)
+  png(path, width = round(width * 90), height = round(height * 90), res = 90)
+  tryCatch(draw_fn(), finally = dev.off())
+  sprintf('<img src="%s" style="width:100%%;max-width:960px;display:block;margin:8px auto;"/>\n',
+          gsub("\\\\", "/", normalizePath(path, mustWork = FALSE)))
+}
+
+# ── Check whether ALL CS SNPs lie wholly within one gene ────────────────────
+check_prioritised_gene <- function(cs_bp, chr_genes) {
+  if (is.null(chr_genes) || nrow(chr_genes) == 0) return(NULL)
+  pos <- cs_bp[!is.na(cs_bp)]
+  if (length(pos) == 0) return(NULL)
+  for (i in seq_len(nrow(chr_genes))) {
+    gname <- chr_genes$external_gene_name[i]
+    if (is.na(gname) || gname == "") gname <- chr_genes$ensembl_gene_id[i]
+    if (all(pos >= chr_genes$start_position[i] & pos <= chr_genes$end_position[i]))
+      return(gname)
+  }
+  NULL
+}
+
+# ── Build the gene track portion shared by both plot types ──────────────────
+make_gene_track <- function(chr_genes, bp_start, bp_stop, cs_pos_pip, chr_val) {
+  if (is.null(chr_genes) || nrow(chr_genes) == 0) return(list(plot = NULL, max_y = 1))
+  genes <- chr_genes %>%
+    filter(start_position <= bp_stop & end_position >= bp_start) %>%
+    mutate(gene_label   = ifelse(!is.na(external_gene_name) & external_gene_name != "",
+                                  external_gene_name, ensembl_gene_id),
+           gene_support = 0)
+  if (nrow(genes) == 0) return(list(plot = NULL, max_y = 1))
+
+  # Accumulate CS PIP support per gene
+  if (!is.null(cs_pos_pip) && nrow(cs_pos_pip) > 0) {
+    for (k in seq_len(nrow(cs_pos_pip))) {
+      hit <- which(genes$start_position <= cs_pos_pip$BP[k] & genes$end_position >= cs_pos_pip$BP[k])
+      genes$gene_support[hit] <- genes$gene_support[hit] + cs_pos_pip$PIP[k]
+    }
+    genes$gene_support <- pmin(genes$gene_support, 1)
+  }
+
+  # Clip gene extents to the plot window for display
+  genes <- genes %>%
+    mutate(start_d = pmax(start_position, bp_start),
+           end_d   = pmin(end_position,   bp_stop))
+
+  # Assign non-overlapping y-levels
+  gd_y  <- genes %>% transmute(gene_id = ensembl_gene_id, start = start_d, end = end_d)
+  gd_y  <- assign_y_levels(gd_y)
+  genes <- left_join(genes, gd_y,
+                     by = c("ensembl_gene_id" = "gene_id", "start_d" = "start", "end_d" = "end"))
+  max_y <- max(genes$y_level, na.rm = TRUE)
+
+  gp <- ggplot(genes, aes(x = start_d, y = y_level)) +
+    geom_segment(aes(xend = end_d, yend = y_level, color = gene_support), linewidth = 4) +
+    scale_color_gradient(low = "#8B73B5", high = "#E66100", limits = c(0, 1), na.value = "#8B73B5",
+                         name = "Cumul.\nPIP") +
+    geom_text_repel(aes(x = (start_d + end_d) / 2, label = gene_label),
+                    size = 2.8, nudge_y = 0.45, direction = "x",
+                    segment.color = NA, max.overlaps = Inf) +
+    scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+    scale_y_continuous(limits = c(0.3, max_y + 1)) +
+    labs(x = sprintf("Chr%d position (GRCh38)", chr_val)) +
+    theme_bw() +
+    theme(axis.text.y  = element_blank(), axis.ticks.y = element_blank(),
+          axis.title.y = element_blank())
+  list(plot = gp, max_y = max_y)
+}
+
+# ── SuSiE locus zoom (CS SNPs: PIP gradient; non-CS: grey) ──────────────────
+make_susie_plot <- function(locus_num, ld) {
+  locus  <- sprintf("%03d", locus_num)
+  fit    <- ld$fits[[locus]]
+  loci   <- ld$loci_input
+  li     <- loci[loci_id == locus_num]
+  chr_val  <- li$chr
+  bp_start <- li$start
+  bp_stop  <- li$end
+
+  if (is.null(fit) || is.null(fit$snp_ids)) return(NULL)
+
+  # Extend window to all SuSiE SNPs present in sumstats
+  snp_pos <- ld$sumstats[SNP %in% fit$snp_ids & CHR == chr_val, BP]
+  if (length(snp_pos) > 0) {
+    bp_start <- min(bp_start, min(snp_pos))
+    bp_stop  <- max(bp_stop,  max(snp_pos))
+  }
+
+  ss <- ld$sumstats[CHR == chr_val & BP >= bp_start & BP <= bp_stop]
+  if (nrow(ss) == 0) return(NULL)
+
+  # PIP lookup
+  pip_map          <- setNames(rep(0, nrow(ss)), ss$SNP)
+  shared           <- intersect(ss$SNP, fit$snp_ids)
+  pip_map[shared]  <- fit$pip[match(shared, fit$snp_ids)]
+  ss[, PIP   := pip_map[SNP]]
+  ss[, log10p := -log10(P)]
+
+  all_cs_snps <- if (!is.null(fit$sets$cs) && length(fit$sets$cs) > 0)
+    unlist(lapply(fit$sets$cs, function(idx) fit$snp_ids[idx])) else character(0)
+  ss[, in_cs := SNP %in% all_cs_snps]
+
+  sp <- ggplot(ss, aes(x = BP, y = log10p)) +
+    geom_point(data = ss[!(in_cs)], aes(size = PIP), color = "#BBBBBB", alpha = 0.5) +
+    geom_point(data = ss[(in_cs)],  aes(color = PIP, size = PIP, alpha = PIP)) +
+    scale_color_gradient(low = "#5D3A9B", high = "#E66100", limits = c(0, 1), name = "PIP") +
+    scale_size_continuous(range  = c(0.5, 5), limits = c(0, 1)) +
+    scale_alpha_continuous(range = c(0.4, 1), limits = c(0, 1)) +
+    scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+    labs(y     = expression(-log[10](italic(p))),
+         title = sprintf("SuSiE L=5 — Locus %d  Chr%d: %s–%s",
+                         locus_num, chr_val,
+                         formatC(bp_start, format = "d", big.mark = ","),
+                         formatC(bp_stop,  format = "d", big.mark = ","))) +
+    guides(size = "none", alpha = "none") +
+    theme_bw() +
+    theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+  cs_pos_pip <- if (length(all_cs_snps) > 0)
+    ss[(in_cs), .(BP, PIP)] else NULL
+  gt <- make_gene_track(ld$gene_cache[[paste0("chr", chr_val)]], bp_start, bp_stop, cs_pos_pip, chr_val)
+
+  if (!is.null(gt$plot))
+    sp + gt$plot + plot_layout(ncol = 1, heights = c(3, max(1.5, gt$max_y * 0.65)))
+  else sp
+}
+
+# ── FINEMAP locus zoom ───────────────────────────────────────────────────────
+make_fm_plot <- function(locus_num, ld) {
+  locus  <- sprintf("%03d", locus_num)
+  loci   <- ld$loci_input
+  li     <- loci[loci_id == locus_num]
+  chr_val  <- li$chr
+  bp_start <- li$start
+  bp_stop  <- li$end
+  fmdir    <- file.path(ld$finemap_dir, locus)
+
+  snp_file <- file.path(fmdir, paste0(locus, ".snp"))
+  if (!file.exists(snp_file)) return(NULL)
+  fm_snps <- fread(snp_file)
+
+  # Best cred file (highest posterior Pr(k))
+  cred_files  <- sort(list.files(fmdir, pattern = paste0("^", locus, "\\.cred[0-9]+$"), full.names = TRUE))
+  best_cred   <- NULL; best_pr <- -1
+  for (cf in cred_files) {
+    hdr <- readLines(cf, n = 2)
+    pr  <- suppressWarnings(as.numeric(regmatches(hdr[1], regexpr("[0-9.eE+\\-]+$", hdr[1]))))
+    if (!is.na(pr) && pr > best_pr) { best_pr <- pr; best_cred <- cf }
+  }
+  all_cs_snps <- character(0)
+  if (!is.null(best_cred)) {
+    clines <- readLines(best_cred)
+    skip   <- grep("^index", clines) - 1
+    if (length(skip) > 0) {
+      cdat <- tryCatch(fread(best_cred, skip = skip[1]), error = function(e) NULL)
+      if (!is.null(cdat)) {
+        for (col in grep("^cred[0-9]+$", names(cdat), value = TRUE)) {
+          snps <- cdat[[col]][!is.na(cdat[[col]])]
+          all_cs_snps <- union(all_cs_snps, snps)
+        }
+      }
+    }
+  }
+
+  snp_pos <- ld$sumstats[SNP %in% fm_snps$rsid & CHR == chr_val, BP]
+  if (length(snp_pos) > 0) {
+    bp_start <- min(bp_start, min(snp_pos))
+    bp_stop  <- max(bp_stop,  max(snp_pos))
+  }
+
+  ss <- ld$sumstats[CHR == chr_val & BP >= bp_start & BP <= bp_stop]
+  if (nrow(ss) == 0) return(NULL)
+
+  pip_map         <- setNames(rep(0, nrow(ss)), ss$SNP)
+  shared          <- intersect(ss$SNP, fm_snps$rsid)
+  pip_map[shared] <- fm_snps$prob[match(shared, fm_snps$rsid)]
+  ss[, PIP    := pip_map[SNP]]
+  ss[, log10p := -log10(P)]
+  ss[, in_cs  := SNP %in% all_cs_snps]
+
+  sp <- ggplot(ss, aes(x = BP, y = log10p)) +
+    geom_point(data = ss[!(in_cs)], aes(size = PIP), color = "#BBBBBB", alpha = 0.5) +
+    geom_point(data = ss[(in_cs)],  aes(color = PIP, size = PIP, alpha = PIP)) +
+    scale_color_gradient(low = "#5D3A9B", high = "#E66100", limits = c(0, 1), name = "PIP") +
+    scale_size_continuous(range  = c(0.5, 5), limits = c(0, 1)) +
+    scale_alpha_continuous(range = c(0.4, 1), limits = c(0, 1)) +
+    scale_x_continuous(limits = c(bp_start, bp_stop), labels = scales::comma) +
+    labs(y     = expression(-log[10](italic(p))),
+         title = sprintf("FINEMAP k=5 — Locus %d  Chr%d: %s–%s",
+                         locus_num, chr_val,
+                         formatC(bp_start, format = "d", big.mark = ","),
+                         formatC(bp_stop,  format = "d", big.mark = ","))) +
+    guides(size = "none", alpha = "none") +
+    theme_bw() +
+    theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+  cs_pos_pip <- if (length(all_cs_snps) > 0) ss[(in_cs), .(BP, PIP)] else NULL
+  gt <- make_gene_track(ld$gene_cache[[paste0("chr", chr_val)]], bp_start, bp_stop, cs_pos_pip, chr_val)
+
+  if (!is.null(gt$plot))
+    sp + gt$plot + plot_layout(ncol = 1, heights = c(3, max(1.5, gt$max_y * 0.65)))
+  else sp
+}
+
+# ── LD heatmap (base R) ──────────────────────────────────────────────────────
+ld_heatmap_fn <- function(LD, locus_num) {
+  n <- nrow(LD)
+  function() {
+    old <- par(no.readonly = TRUE); on.exit(par(old))
+    layout(matrix(c(1L, 2L), 1, 2), widths = c(8, 1))
+    par(mar = c(2, 2, 3, 0.5), pty = "s")
+    image(seq_len(n), seq_len(n), LD, col = ld_pal, zlim = c(-1, 1),
+          axes = FALSE, useRaster = TRUE,
+          main = sprintf("LD r — locus %d  (%d × %d SNPs)", locus_num, n, n))
+    par(mar = c(2, 0.5, 3, 2.5), pty = "m")
+    image(1L, seq(-1, 1, length.out = 256),
+          matrix(seq(-1, 1, length.out = 256), nrow = 1L),
+          col = ld_pal, zlim = c(-1, 1), xaxt = "n", yaxt = "n")
+    axis(4, at = c(-1, 0, 1), labels = c("-1", "0", "1"), las = 1, cex.axis = 0.85)
+    mtext("r", side = 4, line = 2, cex = 0.85)
+    layout(1)
+  }
+}
+```
+
+```{r load-data, include=FALSE}
+all_data <- list()
+
+for (aname in names(analyses)) {
+  a <- analyses[[aname]]
+  message("Loading: ", aname)
+
+  ss <- fread(a$sumstats)
+  ss <- ss[HetPVa > 0.05]
+  ss[, zscore := log(OR) / SE]
+
+  loci <- fread(file.path(a$dir, "loci_input.txt"), header = FALSE,
+                select = 1:4, col.names = c("loci_id", "chr", "start", "end"))
+
+  fits <- list()
+  for (i in seq_len(nrow(loci))) {
+    locus <- sprintf("%03d", loci$loci_id[i])
+    rds   <- file.path(a$dir, "susie", sprintf("%s.susie_l%d.rds", locus, L_USE))
+    if (file.exists(rds)) fits[[locus]] <- readRDS(rds)
+  }
+
+  ld_matrices <- list()
+  for (i in seq_len(nrow(loci))) {
+    locus   <- sprintf("%03d", loci$loci_id[i])
+    ld_f    <- file.path(a$ld_dir, paste0(locus, ".ld.gz"))
+    snp_log <- file.path(a$ld_dir, paste0(locus, ".snp.log"))
+    if (!file.exists(ld_f)) next
+    LD <- as.matrix(fread(ld_f, header = FALSE))
+    if (file.exists(snp_log)) {
+      snps <- readLines(snp_log)
+      if (length(snps) == nrow(LD)) dimnames(LD) <- list(snps, snps)
+    }
+    diag(LD) <- 1.0
+    ld_matrices[[locus]] <- LD
+  }
+
+  # VEP: pick most severe consequence per SNP
+  vep_f   <- file.path(a$dir, "vep_annotation.txt")
+  vep_map <- setNames(character(0), character(0))
+  if (file.exists(vep_f)) {
+    vep_raw <- fread(vep_f)
+    colnames(vep_raw)[1] <- "SNP"
+    impact_rank <- c("HIGH" = 1L, "MODERATE" = 2L, "LOW" = 3L, "MODIFIER" = 4L, "-" = 5L)
+    vep_raw[, rank := impact_rank[IMPACT]]
+    vep_raw[is.na(rank), rank := 5L]
+    vep_best <- vep_raw[order(SNP, rank)][!duplicated(SNP)]
+    gene_col        <- if ("SYMBOL" %in% names(vep_best)) vep_best$SYMBOL else rep("-", nrow(vep_best))
+    vep_consequence <- setNames(vep_best$Consequence, vep_best$SNP)
+    vep_gene        <- setNames(gene_col,              vep_best$SNP)
+  }
+
+  all_data[[aname]] <- list(
+    label       = a$label,
+    sumstats    = ss,
+    loci_input  = loci,
+    fits        = fits,
+    ld_matrices = ld_matrices,
+    vep_consequence = vep_consequence,
+    vep_gene        = vep_gene,
+    finemap_dir = file.path(a$dir, "finemap"),
+    gene_cache  = NULL
+  )
+}
+```
+
+```{r gene-fetch, include=FALSE}
+gene_cache <- if (file.exists(GENE_CACHE_F)) readRDS(GENE_CACHE_F) else list()
+
+grch38 <- NULL
+for (mir in c("useast", "uswest", "asia", "www")) {
+  grch38 <- tryCatch(
+    useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl", mirror = mir),
+    error = function(e) NULL
+  )
+  if (!is.null(grch38)) { message("biomaRt connected: ", mir); break }
+}
+if (is.null(grch38)) warning("All Ensembl mirrors failed — gene tracks disabled")
+
+all_chrs <- unique(unlist(lapply(all_data, function(d) d$loci_input$chr)))
+
+if (!is.null(grch38)) {
+  for (chr in all_chrs) {
+    key <- paste0("chr", chr)
+    if (key %in% names(gene_cache)) next
+    genes <- tryCatch(
+      getBM(attributes = c("ensembl_gene_id", "external_gene_name",
+                           "start_position", "end_position"),
+            filters   = c("chromosome_name", "biotype"),
+            values    = list(as.character(chr), c("protein_coding", "lncRNA")),
+            mart      = grch38),
+      error = function(e) { message("Gene fetch chr", chr, ": ", conditionMessage(e)); NULL }
+    )
+    if (!is.null(genes)) gene_cache[[key]] <- genes
+  }
+  saveRDS(gene_cache, GENE_CACHE_F)
+}
+
+for (aname in names(all_data)) all_data[[aname]]$gene_cache <- gene_cache
+```
+
+```{r render-fn, include=FALSE}
+render_analysis <- function(aname) {
+  ld   <- all_data[[aname]]
+  loci <- ld$loci_input
+
+  # Pre-compute prioritised gene status for SuSiE and FINEMAP separately
+  pg_status <- lapply(seq_len(nrow(loci)), function(i) {
+    lkey      <- sprintf("%03d", loci$loci_id[i])
+    chr_genes <- ld$gene_cache[[paste0("chr", loci$chr[i])]]
+    chr_val_i <- loci$chr[i]
+
+    # SuSiE
+    susie_pg <- FALSE
+    fit <- ld$fits[[lkey]]
+    if (!is.null(fit) && !is.null(fit$sets$cs) && length(fit$sets$cs) > 0 && !is.null(chr_genes)) {
+      for (cs_i in seq_along(fit$sets$cs)) {
+        cs_bp <- ld$sumstats[SNP %in% fit$snp_ids[fit$sets$cs[[cs_i]]] & CHR == chr_val_i, BP]
+        if (!is.null(check_prioritised_gene(cs_bp, chr_genes))) { susie_pg <- TRUE; break }
+      }
+    }
+
+    # FINEMAP — read best cred file
+    fm_pg  <- FALSE
+    fmdir  <- file.path(ld$finemap_dir, lkey)
+    creds  <- sort(list.files(fmdir, pattern = paste0("^", lkey, "\\.cred[0-9]+$"), full.names = TRUE))
+    best_cred <- NULL; best_pr <- -1
+    for (cf in creds) {
+      hdr <- readLines(cf, n = 2)
+      pr  <- suppressWarnings(as.numeric(regmatches(hdr[1], regexpr("[0-9.eE+\\-]+$", hdr[1]))))
+      if (!is.na(pr) && pr > best_pr) { best_pr <- pr; best_cred <- cf }
+    }
+    if (!is.null(best_cred) && !is.null(chr_genes)) {
+      clines <- readLines(best_cred)
+      skip   <- grep("^index", clines) - 1
+      if (length(skip) > 0) {
+        cdat <- tryCatch(fread(best_cred, skip = skip[1]), error = function(e) NULL)
+        if (!is.null(cdat)) {
+          for (col in grep("^cred[0-9]+$", names(cdat), value = TRUE)) {
+            fm_snps <- cdat[[col]][!is.na(cdat[[col]]) & cdat[[col]] != ""]
+            if (length(fm_snps) == 0) next
+            cs_bp <- ld$sumstats[SNP %in% fm_snps & CHR == chr_val_i, BP]
+            if (!is.null(check_prioritised_gene(cs_bp, chr_genes))) { fm_pg <- TRUE; break }
+          }
+        }
+      }
+    }
+    list(susie = susie_pg, fm = fm_pg)
+  })
+
+  # Build dropdown options (★★ = both methods; ★ = one method)
+  opts <- vapply(seq_len(nrow(loci)), function(i) {
+    lnum <- loci$loci_id[i]
+    lkey <- sprintf("%03d", lnum)
+    star <- if (pg_status[[i]]$susie && pg_status[[i]]$fm) " ★★"
+            else if (pg_status[[i]]$susie || pg_status[[i]]$fm) " ★"
+            else ""
+    sprintf('<option value="%s">Locus %d (Chr%d: %s–%s)%s</option>',
+            lkey, lnum, loci$chr[i],
+            formatC(loci$start[i], format = "d", big.mark = ","),
+            formatC(loci$end[i],   format = "d", big.mark = ","),
+            star)
+  }, character(1))
+
+  cat('<div style="margin:10px 0 20px;">\n')
+  cat('<label><strong>Select locus:</strong>&nbsp; (&#9733; = prioritised gene in one method &nbsp;|&nbsp; &#9733;&#9733; = both methods)&nbsp;</label>\n')
+  cat(sprintf('<select style="font-size:14px;padding:4px 10px;" onchange="showLocus(\'%s\', this.value)">\n', aname))
+  cat('<option value="">-- Choose locus --</option>\n')
+  cat(paste(opts, collapse = "\n"), "\n")
+  cat('</select>\n</div>\n')
+
+  # Per-locus content divs
+  for (i in seq_len(nrow(loci))) {
+    locus_num <- loci$loci_id[i]
+    locus     <- sprintf("%03d", locus_num)
+    fit       <- ld$fits[[locus]]
+    chr_val   <- loci$chr[i]
+    has_cs    <- !is.null(fit) && !is.null(fit$sets$cs) && length(fit$sets$cs) > 0
+    n_cs      <- if (has_cs) length(fit$sets$cs) else 0L
+
+    cat(sprintf('\n<div id="%s-%s" class="locus-%s" style="display:none;border-top:2px solid #ccc;padding-top:16px;margin-top:8px;">\n',
+                aname, locus, aname))
+
+    cat(sprintf('<h4 style="margin-top:0">Locus %d &mdash; Chr%d: %s&ndash;%s</h4>\n',
+                locus_num, chr_val,
+                formatC(loci$start[i], format = "d", big.mark = ","),
+                formatC(loci$end[i],   format = "d", big.mark = ",")))
+
+    # SuSiE summary line
+    if (!is.null(fit)) {
+      sigma2  <- if (!is.null(fit$sigma2)) round(fit$sigma2, 4) else "—"
+      lead    <- if (!is.null(fit$pip)) fit$snp_ids[which.max(fit$pip)] else "—"
+      lead_p  <- if (!is.null(fit$pip)) round(max(fit$pip), 4) else "—"
+      cat(sprintf(
+        '<p style="font-size:13px;color:#555;"><strong>SuSiE:</strong> CS: %s &nbsp;|&nbsp; N CS: %d &nbsp;|&nbsp; σ²: %s &nbsp;|&nbsp; Lead SNP: <code>%s</code> (PIP = %s) &nbsp;|&nbsp; Converged: %s</p>\n',
+        ifelse(has_cs, "Yes", "No"), n_cs, sigma2, lead, lead_p, fit$converged))
+    } else {
+      cat('<p><em>No SuSiE result available for this locus.</em></p>\n')
+    }
+
+    # ── Prioritised Gene alerts ──────────────────────────────────────────────
+    if (has_cs) {
+      chr_genes <- ld$gene_cache[[paste0("chr", chr_val)]]
+      for (cs_i in seq_len(n_cs)) {
+        idx     <- fit$sets$cs[[cs_i]]
+        cs_snps <- fit$snp_ids[idx]
+        cs_bp   <- ld$sumstats[SNP %in% cs_snps & CHR == chr_val, BP]
+        pg      <- check_prioritised_gene(cs_bp, chr_genes)
+        if (!is.null(pg)) {
+          cat(sprintf('<div style="background:#fff3cd;border-left:5px solid #ffc107;padding:8px 14px;margin:8px 0;border-radius:4px;"><strong>&#11088; Prioritised Gene (CS%d):</strong> <em>%s</em> &mdash; all credible set SNPs lie within this single gene.</div>\n', cs_i, pg))
+        }
+      }
+    }
+
+    # ── SuSiE section ───────────────────────────────────────────────────────
+    cat('<h5 style="margin-top:18px;border-bottom:1px solid #ddd;padding-bottom:4px;">SuSiE L=5</h5>\n')
+    if (is.null(fit)) {
+      cat('<p><em>No result.</em></p>\n')
+    } else if (!has_cs) {
+      cat(sprintf('<p><em>No credible set. Top PIP SNP: <strong>%s</strong> (PIP = %.4f)</em></p>\n',
+                  fit$snp_ids[which.max(fit$pip)], max(fit$pip)))
+      p <- tryCatch(make_susie_plot(locus_num, ld), error = function(e) NULL)
+      if (!is.null(p)) cat(embed_gg(p, sprintf("%s_%s_susie.png", aname, locus)))
+    } else {
+      for (cs_i in seq_len(n_cs)) {
+        idx     <- fit$sets$cs[[cs_i]]
+        cs_snps <- fit$snp_ids[idx]
+        cs_pips <- fit$pip[idx]
+        cov     <- if (!is.null(fit$sets$coverage)) round(min(fit$sets$coverage, na.rm = TRUE), 4) else "—"
+        cat(sprintf('<p><strong>CS%d:</strong> %d SNPs | Coverage: %s</p>\n', cs_i, length(cs_snps), cov))
+
+        ss_cs <- ld$sumstats[match(cs_snps, ld$sumstats$SNP)]
+
+        # Gene: use VEP SYMBOL if present, fall back to biomaRt positional overlap
+        vep_g  <- ifelse(cs_snps %in% names(ld$vep_gene), ld$vep_gene[cs_snps], NA_character_)
+        blank  <- is.na(vep_g) | vep_g == "-" | vep_g == ""
+        if (any(blank)) {
+          pos_g      <- gene_by_position(cs_snps[blank], chr_val, ld$sumstats,
+                                         ld$gene_cache[[paste0("chr", chr_val)]])
+          vep_g[blank] <- pos_g
+        }
+
+        dt <- data.frame(
+          SNP         = cs_snps,
+          PIP         = round(cs_pips, 4),
+          z           = round(log(ss_cs$OR) / ss_cs$SE, 3),
+          OR          = round(ss_cs$OR, 3),
+          SE          = round(ss_cs$SE, 4),
+          P           = formatC(ss_cs$P, format = "e", digits = 2),
+          Gene        = vep_g,
+          Consequence = ifelse(cs_snps %in% names(ld$vep_consequence), ld$vep_consequence[cs_snps], NA_character_),
+          stringsAsFactors = FALSE
+        )
+        dt <- dt[order(-dt$PIP), ]
+
+        cat(sprintf('<details><summary><strong>CS%d SNPs &mdash; %d SNP%s (click to expand)</strong></summary>\n\n',
+                    cs_i, nrow(dt), if (nrow(dt) == 1) "" else "s"))
+        tbl <- knitr::kable(dt, format = "html", row.names = FALSE,
+                            col.names = c("SNP", "PIP", "z", "OR", "SE", "P", "Gene", "Consequence")) %>%
+          kableExtra::kable_styling(bootstrap_options = c("striped", "condensed", "hover"),
+                                   full_width = FALSE, font_size = 12)
+        cat(as.character(tbl))
+        cat('\n</details>\n')
+      }
+      p <- tryCatch(make_susie_plot(locus_num, ld), error = function(e) NULL)
+      if (!is.null(p)) cat(embed_gg(p, sprintf("%s_%s_susie.png", aname, locus)))
+    }
+
+    # ── FINEMAP section ─────────────────────────────────────────────────────
+    cat('<h5 style="margin-top:18px;border-bottom:1px solid #ddd;padding-bottom:4px;">FINEMAP k=5</h5>\n')
+    fm_log <- file.path(ld$finemap_dir, locus, paste0(locus, ".log_sss"))
+    if (!file.exists(fm_log)) {
+      cat('<p><em>FINEMAP results not available for this locus.</em></p>\n')
+    } else {
+      ll       <- readLines(fm_log)
+      exp_line <- grep("Post-expected", ll, value = TRUE)
+      exp_k    <- if (length(exp_line) > 0)
+        regmatches(exp_line[1], regexpr("[0-9.]+$", exp_line[1])) else "—"
+      cat(sprintf('<p><strong>Post-expected # causal SNPs:</strong> %s</p>\n', exp_k))
+
+      # ── FINEMAP prioritised gene alerts ────────────────────────────────────
+      fmdir_pg   <- file.path(ld$finemap_dir, locus)
+      creds_pg   <- sort(list.files(fmdir_pg, pattern = paste0("^", locus, "\\.cred[0-9]+$"), full.names = TRUE))
+      best_pg    <- NULL; best_pr_pg <- -1
+      for (cf in creds_pg) {
+        hdr <- readLines(cf, n = 2)
+        pr  <- suppressWarnings(as.numeric(regmatches(hdr[1], regexpr("[0-9.eE+\\-]+$", hdr[1]))))
+        if (!is.na(pr) && pr > best_pr_pg) { best_pr_pg <- pr; best_pg <- cf }
+      }
+      if (!is.null(best_pg)) {
+        clines_pg <- readLines(best_pg)
+        skip_pg   <- grep("^index", clines_pg) - 1
+        if (length(skip_pg) > 0) {
+          cdat_pg  <- tryCatch(fread(best_pg, skip = skip_pg[1]), error = function(e) NULL)
+          chr_genes_pg <- ld$gene_cache[[paste0("chr", chr_val)]]
+          if (!is.null(cdat_pg) && !is.null(chr_genes_pg)) {
+            fm_cs_cols <- grep("^cred[0-9]+$", names(cdat_pg), value = TRUE)
+            for (fcs_i in seq_along(fm_cs_cols)) {
+              fm_pg_snps <- cdat_pg[[fm_cs_cols[fcs_i]]]
+              fm_pg_snps <- fm_pg_snps[!is.na(fm_pg_snps) & fm_pg_snps != ""]
+              if (length(fm_pg_snps) == 0) next
+              fm_cs_bp <- ld$sumstats[SNP %in% fm_pg_snps & CHR == chr_val, BP]
+              pg_fm    <- check_prioritised_gene(fm_cs_bp, chr_genes_pg)
+              if (!is.null(pg_fm)) {
+                cat(sprintf('<div style="background:#d4edda;border-left:5px solid #28a745;padding:8px 14px;margin:8px 0;border-radius:4px;"><strong>&#11088; Prioritised Gene — FINEMAP (CS%d):</strong> <em>%s</em> &mdash; all credible set SNPs lie within this single gene.</div>\n',
+                            fcs_i, pg_fm))
+              }
+            }
+          }
+        }
+      }
+
+      # ── FINEMAP per-CS SNP tables ──────────────────────────────────────────
+      fmdir    <- file.path(ld$finemap_dir, locus)
+      snp_file <- file.path(fmdir, paste0(locus, ".snp"))
+      cred_files <- sort(list.files(fmdir, pattern = paste0("^", locus, "\\.cred[0-9]+$"), full.names = TRUE))
+
+      # Use best cred file (highest posterior Pr(k)) for CS membership
+      best_cred <- NULL; best_pr <- -1
+      for (cf in cred_files) {
+        hdr <- readLines(cf, n = 2)
+        pr  <- suppressWarnings(as.numeric(regmatches(hdr[1], regexpr("[0-9.eE+\\-]+$", hdr[1]))))
+        if (!is.na(pr) && pr > best_pr) { best_pr <- pr; best_cred <- cf }
+      }
+
+      if (!is.null(best_cred) && file.exists(snp_file)) {
+        fm_snps <- fread(snp_file)
+        clines  <- readLines(best_cred)
+        skip    <- grep("^index", clines) - 1
+        if (length(skip) > 0) {
+          cdat     <- tryCatch(fread(best_cred, skip = skip[1]), error = function(e) NULL)
+          cs_cols  <- if (!is.null(cdat)) grep("^cred[0-9]+$", names(cdat), value = TRUE) else character(0)
+
+          for (cs_i in seq_along(cs_cols)) {
+            fm_cs_snps <- cdat[[cs_cols[cs_i]]]
+            fm_cs_snps <- fm_cs_snps[!is.na(fm_cs_snps) & fm_cs_snps != ""]
+            if (length(fm_cs_snps) == 0) next
+
+            fm_pips  <- fm_snps$prob[match(fm_cs_snps, fm_snps$rsid)]
+            ss_fm    <- ld$sumstats[match(fm_cs_snps, ld$sumstats$SNP)]
+
+            # Gene: VEP then positional fallback
+            vep_g  <- ifelse(fm_cs_snps %in% names(ld$vep_gene), ld$vep_gene[fm_cs_snps], NA_character_)
+            blank  <- is.na(vep_g) | vep_g == "-" | vep_g == ""
+            if (any(blank)) {
+              pos_g        <- gene_by_position(fm_cs_snps[blank], chr_val, ld$sumstats,
+                                               ld$gene_cache[[paste0("chr", chr_val)]])
+              vep_g[blank] <- pos_g
+            }
+
+            dt_fm <- data.frame(
+              SNP         = fm_cs_snps,
+              PIP         = round(fm_pips, 4),
+              z           = round(log(ss_fm$OR) / ss_fm$SE, 3),
+              OR          = round(ss_fm$OR, 3),
+              SE          = round(ss_fm$SE, 4),
+              P           = formatC(ss_fm$P, format = "e", digits = 2),
+              Gene        = vep_g,
+              Consequence = ifelse(fm_cs_snps %in% names(ld$vep_consequence),
+                                   ld$vep_consequence[fm_cs_snps], NA_character_),
+              stringsAsFactors = FALSE
+            )
+            dt_fm <- dt_fm[order(-dt_fm$PIP), ]
+
+            cat(sprintf('<details><summary><strong>CS%d SNPs &mdash; %d SNP%s (click to expand)</strong></summary>\n\n',
+                        cs_i, nrow(dt_fm), if (nrow(dt_fm) == 1) "" else "s"))
+            tbl <- knitr::kable(dt_fm, format = "html", row.names = FALSE,
+                                col.names = c("SNP", "PIP", "z", "OR", "SE", "P", "Gene", "Consequence")) %>%
+              kableExtra::kable_styling(bootstrap_options = c("striped", "condensed", "hover"),
+                                       full_width = FALSE, font_size = 12)
+            cat(as.character(tbl))
+            cat('\n</details>\n')
+          }
+        }
+      }
+
+      p_fm <- tryCatch(make_fm_plot(locus_num, ld), error = function(e) NULL)
+      if (!is.null(p_fm)) cat(embed_gg(p_fm, sprintf("%s_%s_finemap.png", aname, locus)))
+    }
+
+    # ── LD Heatmap section ──────────────────────────────────────────────────
+    cat('<h5 style="margin-top:18px;border-bottom:1px solid #ddd;padding-bottom:4px;">LD Heatmap</h5>\n')
+    LD <- ld$ld_matrices[[locus]]
+    if (!is.null(LD)) {
+      n_snps <- nrow(LD)
+      cat(sprintf('<p>%d &times; %d LD matrix (signed r; blue = negative, red = positive)</p>\n', n_snps, n_snps))
+      cat(embed_base(ld_heatmap_fn(LD, locus_num), sprintf("%s_%s_ld.png", aname, locus)))
+    } else {
+      cat('<p><em>LD matrix not available for this locus.</em></p>\n')
+    }
+
+    cat('</div>\n')  # end locus div
+  }
+}
+```
+
+## Results {.tabset}
+
+### SCZ vs BIP
+
+```{r tab-sczvsbp, results='asis', echo=FALSE}
+render_analysis("sczvsbp")
+```
+
+### SCZ vs BIP1
+
+```{r tab-sczvsbp1, results='asis', echo=FALSE}
+render_analysis("sczvsbp1")
+```
+
+### SCZ + BIP vs Controls
+
+```{r tab-sczandbp, results='asis', echo=FALSE}
+render_analysis("sczandbp")
+```
+
+---
+<small>PGC4 fine-mapping — Cardiff University &nbsp;|&nbsp; SuSiE-RSS L=5 + FINEMAP-SSS k=5 &nbsp;|&nbsp; GRCh38</small>
